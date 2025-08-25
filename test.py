@@ -290,4 +290,43 @@ with col2:
 
 with col1:
     st.subheader("📝 증상/상황을 자유롭게 적어주세요")
-    examples = st.pills("예시"
+                            # 예시 입력 버튼들
+    example_cases = [
+        "가슴이 너무 아파요 식은땀나요",
+        "발목이 부러진 것 같아요",
+        "뜨거운 물에 손 데었어요",
+        "코피가 멈추지 않아요",
+        "사람이 갑자기 쓰러져서 숨을 안 쉬어요",
+    ]
+    chosen_example = st.selectbox("예시 선택 (선택 시 자동 입력)", [""] + example_cases)
+
+    query = st.text_area("여기에 증상/상황을 입력하세요", value=chosen_example, height=100)
+
+    if st.button("🔍 확인하기") and query.strip():
+        st.markdown("### 🔎 결과")
+
+        # 레드 플래그 우선 확인
+        crit = detect_critical(query)
+        if crit:
+            st.error(f"⚠️ 긴급 신호 감지: {', '.join(crit)} → 즉시 119 연락 권고")
+
+        # 매칭
+        if match_mode.startswith("고급"):
+            results = rank_with_semantic(query, knowledge_base, topk=topk)
+            if not results:  # fallback
+                results = rank_with_tfidf(query, knowledge_base, topk=topk)
+        else:
+            results = rank_with_tfidf(query, knowledge_base, topk=topk)
+
+        # 출력
+        for idx, score in results:
+            item = knowledge_base[idx]
+            st.subheader(f"🩺 {item['label']} (유사도 {score:.2f})")
+            st.write(f"**권장 진료과/기관:** {item['dept']}")
+            st.markdown("**응급처치 단계:**")
+            for step in item['aid']:
+                st.markdown(f"- {step}")
+            if item.get("red_flags"):
+                st.markdown(f"**119 필요 신호:** {', '.join(item['red_flags'])}")
+            st.divider()
+
