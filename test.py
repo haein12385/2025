@@ -1,332 +1,199 @@
-# -*- coding: utf-8 -*-
-"""
-응급처치 & 진료과 안내 스트림릿 앱
-
-기능 요약
-- 사용자가 자유롭게 증상/사고 상황을 입력하면 의미 유사도 기반으로 가장 유사한 항목을 찾아
-  1) 즉시 해야 할 응급처치 단계
-  2) 권장 내원 진료과/기관
-  3) 119 연락 권고 기준(레드 플래그)
-  를 보여줍니다.
-
-- 의미 유사도: SentenceTransformer(권장) -> 실패 시 TF-IDF 코사인 유사도 대체
-- 한국 로컬 용어(119, 진료과명) 적용
-- 절대적 의학적 조언이 아니며, 긴급/중증 의심 시 즉시 119 연락 및 응급실 방문 안내
-
-실행
-  $ pip install streamlit scikit-learn sentence-transformers torch
-  $ streamlit run app.py
-
-메모
-- 배포 환경에서 sentence-transformers 설치가 어렵다면 사이드바에서 "간단 매칭(TF-IDF)"로 바꿔 사용하세요.
-- 필요 시 knowledge_base 항목을 자유롭게 추가/수정하세요.
-"""
-
-import os
-import re
-import json
-from typing import List, Dict, Any
-
 import streamlit as st
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+import re
+from urllib.parse import quote_plus
+from datetime import datetime
 
-# ===== 시맨틱 임베딩 로딩 (선택) =====
-_ST_MODEL = None
-_ST_AVAILABLE = False
+# -----------------------------
+# Page config
+# -----------------------------
+st.set_page_config(
+    page_title="응급처치 · 진료안내 도우미",
+    page_icon="🩹",
+    layout="wide"
+)
 
-@st.cache_resource(show_spinner=False)
-def load_st_model(model_name: str = "sentence-transformers/paraphrase-MiniLM-L6-v2"):
-    global _ST_MODEL, _ST_AVAILABLE
-    try:
-        from sentence_transformers import SentenceTransformer
-        _ST_MODEL = SentenceTransformer(model_name)
-        _ST_AVAILABLE = True
-    except Exception as e:
-        _ST_MODEL = None
-        _ST_AVAILABLE = False
-    return _ST_MODEL, _ST_AVAILABLE
+# -----------------------------
+# Helper data
+# -----------------------------
+TRIAGE_INFO = {
+    1: {"label": "🚨 즉시 119 (혹은 응급실로 이동)", "color": "#ef4444"},
+    2: {"label": "⚠️ 오늘 중 응급실/야간진료 권장", "color": "#f59e0b"},
+    3: {"label": "⏱ 24–48시간 내 외래 방문 권장", "color": "#0ea5e9"},
+    4: {"label": "✅ 자가 처치 우선 + 경과 관찰", "color": "#22c55e"},
+}
 
-# ===== 지식 베이스 =====
-# label: 대표 명칭, keywords: 유사 표현들, dept: 권장 진료과/기관, aid: 응급처치 단계, red_flags: 즉시 119 기준
-knowledge_base: List[Dict[str, Any]] = [
+# 증상/상태 사전: 키워드 매칭 → 우선순위, 응급처치, 진료과, 간단한 응급처치 팁
+CONDITIONS = [
     {
-        "label": "심정지/의식 없음",
-        "keywords": ["의식이 없다", "반응이 없다", "심장 멈춤", "맥박 없음", "숨을 안 쉰다", "심정지"],
-        "dept": "즉시 119 / 응급실(응급의학과)",
-        "aid": [
-            "119에 즉시 신고(스피커폰). AED가 있으면 가져오도록 요청.",
-            "호흡/맥박 확인(10초 이내). 비정상 호흡 또는 무호흡이면 CPR 시작.",
-            "가슴압박: 분당 100~120회, 깊이 5~6cm, 완전 이완 유지.",
-            "AED 도착 시 음성 지시에 따라 패드 부착 및 제세동.",
+        "name": "심근허혈/심근경색 의심 (가슴통증)",
+        "keywords": ["가슴통증", "흉통", "가슴 아픔", "압박감", "식은땀", "숨참", "호흡곤란", "왼팔", "어깨", "턱 통증"],
+        "triage": 1,
+        "dept": "응급의학과 (응급실)",
+        "first_aid": [
+            "즉시 119에 전화하거나 가까운 응급실로 이동합니다.",
+            "편안한 자세로 안정, 꽉 끼는 옷 풀기.",
+            "아스피린 복용 이력이 있고 의사가 금기하지 않았다면 300mg 한 번 씹어 삼키는 것을 고려 (알레르기/위장관 출혈 병력 있으면 금지).",
         ],
-        "red_flags": ["의식 없음", "무호흡", "심정지", "맥박 없음"],
+        "simple_tip": "편안히 눕히고 옷을 느슨하게 하여 숨쉬기 편하게 해주세요.",
+        "red_flags": ["휴식해도 지속되는 흉통", "식은땀/구역", "목·턱·왼팔로 퍼지는 통증"]
     },
     {
-        "label": "질식/기도막힘",
-        "keywords": ["목에 걸림", "숨 막힘", "질식", "이물질", "기침 안됨", "하임리히"],
-        "dept": "즉시 119 / 응급실",
-        "aid": [
-            "기침 가능하면 계속 기침하도록 격려.",
-            "기침/소리 불가·청색증이면 성인/소아 하임리히법(복부 밀어올리기) 시행.",
-            "영아(1세 미만): 등 두드리기 5회 + 가슴압박 5회 반복.",
-            "의식 소실 시 CPR 및 119 신고.",
+        "name": "골절/염좌 의심",
+        "keywords": ["부러짐", "골절", "딱 소리", "붓기", "멍", "발목 접질림", "손목", "통증 심함", "체중 부하 불가"],
+        "triage": 3,
+        "dept": "정형외과",
+        "first_aid": [
+            "RICE: 휴식(Rest)·냉찜질(Ice 20분 이내)·압박(Compression)·거상(Elevation).",
+            "심한 변형/저림·창백 있으면 부목 고정 후 응급실.",
         ],
-        "red_flags": ["숨 못쉼", "청색증", "기침 불가"],
+        "simple_tip": "수건에 싸서 냉찜질하고, 아픈 부위는 움직이지 않게 고정하세요.",
+        "red_flags": ["심한 변형", "저림/감각저하", "창백/혈류저하"]
     },
     {
-        "label": "심근경색 의심(가슴 통증)",
-        "keywords": ["가슴통증", "가슴이 조인다", "왼팔 저림", "식은땀", "압박감", "숨참"],
-        "dept": "즉시 119 / 응급실(심장혈관센터 가능 시)",
-        "aid": [
-            "안정 자세, 꽉 끼는 옷 풀기.",
-            "아스피린 알약(성인 300mg 내외)을 알레르기/금기 없을 때 씹어 삼키는 것을 고려(확실하지 않으면 복용 X).",
-            "절대 혼자 운전 금지. 즉시 119 호출.",
+        "name": "코피",
+        "keywords": ["코피", "비출혈"],
+        "triage": 4,
+        "dept": "이비인후과",
+        "first_aid": [
+            "앞으로 약간 숙이고 콧망울을 10분간 지속 압박.",
+            "목 뒤 얼음찜질, 피는 삼키지 않기.",
         ],
-        "red_flags": ["휴식해도 지속되는 가슴통증", "호흡곤란", "식은땀"],
+        "simple_tip": "고개를 앞으로 숙이고 콧망울을 손가락으로 10분간 꾹 누르세요.",
+        "red_flags": ["20분 이상 지속", "머리 외상 후 발생", "항응고제 복용"]
     },
     {
-        "label": "뇌졸중 의심(FAST)",
-        "keywords": ["갑자기 마비", "말 어눌", "한쪽 저림", "안면마비", "시야장애", "어지럼 심함"],
-        "dept": "즉시 119 / 뇌졸중 센터 있는 병원 응급실",
-        "aid": [
-            "FAST 확인(얼굴 처짐, 팔 들기 어려움, 말 어눌).",
-            "증상 시작 시각 기록, 음식/음료 금지.",
-            "즉시 119 호출, 혼자 이동 금지.",
+        "name": "화상 (열/화학/전기)",
+        "keywords": ["화상", "데임", "뜨거운 물", "불에", "전기쇼크", "화학물질"],
+        "triage": 2,
+        "dept": "응급의학과/성형외과/피부과",
+        "first_aid": [
+            "즉시 흐르는 미지근한 물에 20분 이상 냉각 (얼음 금지).",
+            "물집은 터뜨리지 말고 깨끗하게 덮기. 화학물은 최소 20분 이상 물로 씻어내기.",
+            "전기화상은 겉이 약해 보여도 반드시 병원 평가.",
         ],
-        "red_flags": ["갑작스런 신경학적 결손", "의식 저하"],
-    },
-    {
-        "label": "대량출혈/지혈",
-        "keywords": ["피가 멈추지 않음", "대량 출혈", "칼에 베임", "동맥 출혈", "피철철"],
-        "dept": "즉시 119 / 응급실",
-        "aid": [
-            "깨끗한 거즈/천으로 상처 부위를 강하게 직접 압박.",
-            "지혈대는 마지막 수단(사용법 숙지 시).",
-            "쇼크 예방: 눕히고 다리 약간 올리기(머리·척추 손상 의심 시 제외).",
-        ],
-        "red_flags": ["분출성 출혈", "지속적 대량 출혈", "쇼크 소견"],
-    },
-    {
-        "label": "골절/염좌",
-        "keywords": ["부러짐", "삐끗", "발목 접질림", "통증으로 체중 부하 불가", "붓기", "멍"],
-        "dept": "정형외과(중증 외상·개방창은 응급실)",
-        "aid": [
-            "RICE: 휴식(Rest), 냉찜질(Ice, 20분 이내), 압박(Compression), 거상(Elevation).",
-            "심한 변형/개방창/감각저하 시 고정 후 응급실.",
-        ],
-        "red_flags": ["심한 변형", "감각/혈류 저하", "개방성 골절"],
-    },
-    {
-        "label": "화상",
-        "keywords": ["데임", "뜨거운 물", "기름에 데임", "화상", "물집"],
-        "dept": "경미: 피부과/외과 | 광범위/3도 의심: 응급실/화상센터",
-        "aid": [
-            "즉시 미지근한 흐르는 물로 20분 이상 냉각(얼음 직접 대지 않기).",
-            "금속/의복이 붙었으면 억지로 떼지 말고 의료기관 이동.",
-            "물집은 터뜨리지 않기, 멸균 거즈로 보호.",
-        ],
-        "red_flags": ["얼굴/회음부/손·발/관절부 심한 화상", "광범위 수포", "흡입 손상 의심"],
-    },
-    {
-        "label": "코피",
-        "keywords": ["코피", "비출혈", "코에서 피", "코피 멈추지 않음"],
-        "dept": "이비인후과(지속 출혈은 응급실)",
-        "aid": [
-            "몸을 약간 숙이고 콧망울을 10분 이상 지속 압박.",
-            "목 뒤 얼음찜질은 보조, 면봉·휴지 깊숙이 넣지 않기.",
-        ],
-        "red_flags": ["15분 이상 지속 출혈", "탈수/어지럼 동반"],
-    },
-    {
-        "label": "눈 이물/화학손상",
-        "keywords": ["눈에 이물", "눈 아픔", "화학물질 튐", "콘택트렌즈", "시력 흐림"],
-        "dept": "안과(화학 손상은 응급실 우선)",
-        "aid": [
-            "깨끗한 수돗물/생리식염수로 15분 이상 지속 세척.",
-            "비비지 말기, 콘택트렌즈 제거.",
-        ],
-        "red_flags": ["화학물질 노출", "시력 급격 저하", "심한 통증"],
-    },
-    {
-        "label": "벌/곤충 쏘임",
-        "keywords": ["벌에 쏘임", "모기", "벌침", "곤충", "알레르기"],
-        "dept": "피부과/알레르기내과(전신 반응은 응급실)",
-        "aid": [
-            "냉찜질, 물로 세척, 가려움 완화 연고 사용 고려.",
-            "벌침이 보이면 조심히 제거(핀셋보다 긁어내기).",
-        ],
-        "red_flags": ["호흡곤란", "입술/눈 주변 부종", "전신 두드러기"],
-    },
-    {
-        "label": "개/동물 교상",
-        "keywords": ["개에 물림", "고양이에게 물림", "동물에게 물림", "교상", "광견병"],
-        "dept": "응급실/외과(필요 시 예방접종실/보건소 안내)",
-        "aid": [
-            "흐르는 물과 비누로 5분 이상 세척, 멸균 거즈로 덮기.",
-            "상처 깊으면 지연 봉합 고려, 파상풍/광견병 예방접종 평가.",
-        ],
-        "red_flags": ["깊은 관통상", "발열·농 배출", "안면/손 부위"],
-    },
-    {
-        "label": "복통(일반)",
-        "keywords": ["배 아픔", "속이 뒤틀림", "명치통증", "설사 복통"],
-        "dept": "내과/소화기내과(급성 심하면 응급실)",
-        "aid": [
-            "금식, 미지근한 물 소량씩, 증상/동반 증상 기록.",
-            "지속·악화 시 의료기관 방문.",
-        ],
-        "red_flags": ["피 섞인 변/토혈", "고열/탈수", "임산부의 복통"],
-    },
-    {
-        "label": "발작/간질 의심",
-        "keywords": ["경련", "발작", "거품", "의식 잃음", "간질"],
-        "dept": "응급실/신경과",
-        "aid": [
-            "주변 위험물 치우고 머리 보호, 억지로 붙잡거나 물건 물리지 말기.",
-            "발작 후 기도 확보를 위해 옆으로 눕히기(회복자세).",
-        ],
-        "red_flags": ["5분 이상 지속", "연속 발작", "첫 발작"],
-    },
-    {
-        "label": "과호흡/공황 의심",
-        "keywords": ["과호흡", "숨 가쁨", "손발 저림", "불안", "공황"],
-        "dept": "정신건강의학과/내과",
-        "aid": [
-            "천천히 코로 들이마시고 입으로 내쉬는 호흡 유도(4-7-8 호흡 등).",
-            "안심시키고 자극 줄이기.",
-        ],
-        "red_flags": ["의식 저하", "가슴통증 동반", "호흡 곤란 악화"],
-    },
+        "simple_tip": "얼음 대신 흐르는 시원한 물에 20분 이상 식히세요.",
+        "red_flags": ["얼굴·손·발·사타구니·관절부위", "넓은 면적", "흡입손상 의심"]
+    }
 ]
 
-# 레드 플래그 키워드(입력 문장에서 발견되면 최우선 경고)
-CRITICAL_TRIGGERS = [
-    "의식 없음", "반응 없음", "숨 못", "호흡 곤란", "숨 쉬기 힘듦", "피 철철", "피 멈추지", "심장", "가슴 통증",
-    "마비", "말 어눌", "청색", "경련", "질식", "중독", "화학물질", "심한 통증"
-]
+EMERGENCY_BONUS_WORDS = ["의식 저하", "경련", "호흡곤란", "피가 멈추지", "대량", "청색", "마비", "심한 흉통"]
 
-# ===== 유틸 =====
-
+# -----------------------------
+# Matching logic
+# -----------------------------
 def normalize(txt: str) -> str:
-    txt = txt.lower().strip()
-    txt = re.sub(r"\s+", " ", txt)
-    return txt
-
-@st.cache_data(show_spinner=False)
-def build_tfidf_corpus(items: List[Dict[str, Any]]):
-    docs = []
-    for it in items:
-        docs.append(it["label"] + " " + " ".join(it.get("keywords", [])))
-    vec = TfidfVectorizer(ngram_range=(1,2), min_df=1)
-    X = vec.fit_transform(docs)
-    return vec, X
-
-@st.cache_resource(show_spinner=False)
-def build_semantic_corpus(items: List[Dict[str, Any]]):
-    model, ok = load_st_model()
-    if not ok:
-        return None, None, False
-    docs = []
-    for it in items:
-        docs.append(it["label"] + " " + " ".join(it.get("keywords", [])))
-    emb = model.encode(docs, normalize_embeddings=True)
-    return model, emb, True
+    return re.sub(r"\s+", " ", txt.strip())
 
 
-def rank_with_semantic(query: str, items: List[Dict[str, Any]], topk: int = 3):
-    model, emb, ok = build_semantic_corpus(items)
-    if not ok:
-        return []
-    qv = model.encode([query], normalize_embeddings=True)
-    sims = (qv @ emb.T).ravel()
-    idx = sims.argsort()[::-1][:topk]
-    results = [(int(i), float(sims[i])) for i in idx]
-    return results
+def score_condition(user_text: str, cond: dict) -> int:
+    text = user_text
+    return sum(1 for k in cond["keywords"] if k in text)
 
 
-def rank_with_tfidf(query: str, items: List[Dict[str, Any]], topk: int = 3):
-    vec, X = build_tfidf_corpus(items)
-    q = vec.transform([query])
-    sims = cosine_similarity(q, X).ravel()
-    idx = sims.argsort()[::-1][:topk]
-    results = [(int(i), float(sims[i])) for i in idx]
-    return results
+def analyze(user_text: str):
+    user_text = normalize(user_text)
+    results = []
+    for cond in CONDITIONS:
+        s = score_condition(user_text, cond)
+        if s > 0:
+            results.append((s, cond))
+    # Emergency bonus
+    emergency_hit = any(w in user_text for w in EMERGENCY_BONUS_WORDS)
+    results.sort(key=lambda x: (-x[0], x[1]["triage"]))
+    return results, emergency_hit
 
 
-def detect_critical(query: str) -> List[str]:
-    hits = []
-    q = normalize(query)
-    for kw in CRITICAL_TRIGGERS:
-        if kw in q:
-            hits.append(kw)
-    return hits
+# -----------------------------
+# UI
+# -----------------------------
+with st.sidebar:
+    st.markdown("""
+    # 🩹 응급처치 · 진료안내 도우미
+    
+    증상이나 다친 부위를 적으면 **우선 해야 할 응급처치**와 **권장 진료과/이동 여부**를 안내해요.
+    
+    **중요 고지**
+    - 본 앱은 학습/참고용 정보입니다. 실제 진료를 대체하지 않아요.
+    - **심한 통증, 호흡곤란, 의식 변화** 등 위험 신호가 보이면 즉시 **119**에 연락하세요.
+    """)
 
-# ===== UI =====
-st.set_page_config(page_title="응급처치 & 진료과 안내", page_icon="🆘", layout="wide")
-
-st.title("🆘 증상 입력만 하면 알려주는 응급처치 & 진료과 안내")
-
-with st.expander("❗️중요 고지", expanded=True):
-    st.markdown(
-        """
-        - 이 도구는 **응급처치 참고용**입니다. 정확한 진단을 대신하지 않습니다.
-        - **심각한 증상**(의식 소실, 호흡 곤란, 대량 출혈, 심한 가슴 통증 등)은 **즉시 119**에 연락하세요.
-        - 입력한 내용은 로컬에서만 처리되며, 서버로 전송되지 않습니다(배포 방식에 따라 달라질 수 있음).
-        """
-    )
+st.title("🆘 내 증상에 맞는 응급처치와 진료과 안내")
+st.caption("입력 예: ‘가슴이 조여오고 왼팔로 통증이 퍼지면서 식은땀이 나요’ · ‘뜨거운 물에 데였고 물집이 생겼어요’ · ‘발목을 접질렀어요’")
 
 col1, col2 = st.columns([2, 1])
-
-with col2:
-    st.subheader("⚙️ 매칭 설정")
-    match_mode = st.radio(
-        "매칭 방식 선택",
-        ["고급 의미 유사도(권장)", "간단 매칭(TF-IDF)"],
-        index=0
-    )
-    topk = st.slider("결과 개수", 1, 5, 3)
-    st.caption("*설치 환경에 따라 의미 유사도 모델이 자동으로 TF-IDF로 대체될 수 있습니다.")
-
 with col1:
-    st.subheader("📝 증상/상황을 자유롭게 적어주세요")
-                            # 예시 입력 버튼들
-    example_cases = [
-        "가슴이 너무 아파요 식은땀나요",
-        "발목이 부러진 것 같아요",
-        "뜨거운 물에 손 데었어요",
-        "코피가 멈추지 않아요",
-        "사람이 갑자기 쓰러져서 숨을 안 쉬어요",
-    ]
-    chosen_example = st.selectbox("예시 선택 (선택 시 자동 입력)", [""] + example_cases)
+    text = st.text_area("어디가 아픈가요/어떻게 다쳤나요?", height=160, placeholder="증상, 발생 상황, 동반 증상 등을 적어주세요.")
+with col2:
+    loc = st.text_input("지역/동네 (선택)", placeholder="예: 서울 강남역, 부산 서면")
+    st.write("")
+    st.markdown("**오늘 날짜**: " + datetime.now().strftime("%Y-%m-%d %H:%M"))
 
-    query = st.text_area("여기에 증상/상황을 입력하세요", value=chosen_example, height=100)
+run = st.button("🔎 분석하기")
 
-    if st.button("🔍 확인하기") and query.strip():
-        st.markdown("### 🔎 결과")
-
-        # 레드 플래그 우선 확인
-        crit = detect_critical(query)
-        if crit:
-            st.error(f"⚠️ 긴급 신호 감지: {', '.join(crit)} → 즉시 119 연락 권고")
-
-        # 매칭
-        if match_mode.startswith("고급"):
-            results = rank_with_semantic(query, knowledge_base, topk=topk)
-            if not results:  # fallback
-                results = rank_with_tfidf(query, knowledge_base, topk=topk)
+if run:
+    if not text.strip():
+        st.warning("증상을 먼저 입력해 주세요.")
+    else:
+        results, emergency_hit = analyze(text)
+        if not results:
+            st.info("명확한 매칭이 없어요. 그래도 위험 신호가 있으면 119에 연락하세요. 증상을 조금 더 구체적으로 적어주세요.")
         else:
-            results = rank_with_tfidf(query, knowledge_base, topk=topk)
+            top_score = results[0][0]
+            picks = [c for s, c in results if s == top_score][:3]
 
-        # 출력
-        for idx, score in results:
-            item = knowledge_base[idx]
-            st.subheader(f"🩺 {item['label']} (유사도 {score:.2f})")
-            st.write(f"**권장 진료과/기관:** {item['dept']}")
-            st.markdown("**응급처치 단계:**")
-            for step in item['aid']:
-                st.markdown(f"- {step}")
-            if item.get("red_flags"):
-                st.markdown(f"**119 필요 신호:** {', '.join(item['red_flags'])}")
+            final_triage = min(c["triage"] for c in picks)
+            if emergency_hit and final_triage > 1:
+                final_triage = 1
+
+            tri = TRIAGE_INFO[final_triage]
+            st.markdown(f"""
+            <div style='padding:14px;border-radius:14px;border:2px solid {tri['color']};'>
+                <div style='font-size:1.1rem'>우선순위</div>
+                <div style='font-weight:700;color:{tri['color']};font-size:1.3rem'>{tri['label']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.subheader("🔍 가능한 원인(추정)")
+            for c in picks:
+                with st.expander(f"{c['name']} · 권장: {c['dept']} · 우선순위: {TRIAGE_INFO[c['triage']]['label']}"):
+                    st.markdown("**응급처치 가이드**")
+                    for step in c["first_aid"]:
+                        st.markdown(f"- {step}")
+                    if "simple_tip" in c:
+                        st.markdown("**👉 내가 할 수 있는 간단한 응급처치**")
+                        st.info(c["simple_tip"])
+                    st.markdown("**위험 신호 (보이면 즉시 병원)**")
+                    st.markdown(", ".join(c["red_flags"]))
+
+            st.subheader("🏥 어디로 가야 하나요?")
+            if final_triage == 1:
+                base = "응급실"
+            elif final_triage == 2:
+                base = "응급실 야간진료"
+            elif final_triage == 3:
+                depts = {}
+                for c in picks:
+                    depts[c["dept"]] = depts.get(c["dept"], 0) + 1
+                base = max(depts, key=depts.get)
+            else:
+                base = picks[0]["dept"]
+
+            query = base if not loc.strip() else f"{loc} {base}"
+            naver = f"https://map.naver.com/p/search/{quote_plus(query)}"
+            kakao = f"https://map.kakao.com/?q={quote_plus(query)}"
+            google = f"https://www.google.com/maps/search/{quote_plus(query)}"
+            st.markdown(
+                f"[🧭 네이버지도에서 검색하기]({naver}) · [🗺 카카오맵에서 검색하기]({kakao}) · [🌎 구글지도에서 검색하기]({google})"
+            )
+
             st.divider()
-
+            st.markdown("""
+            ### ℹ️ 참고 안내
+            - 이 도구는 **전문의 진단을 대체하지 않습니다**. 
+            - 약 복용, 알레르기, 지병이 있다면 반드시 의료진에게 알리세요.
+            - 아동/임신부/고령자는 동일 증상이라도 **더 낮은 역치로 병원 방문**이 필요합니다.
+            """)
+else:
+    st.markdown(
+        "> ⚡ 증상을 입력하고 ‘분석하기’를 누르면 결과가 표시됩니다. 자주 겪는 상황(골절, 화상, 코피 등)에 대한 응급처치 팁도 함께 제공돼요."
+    )
