@@ -1,8 +1,7 @@
-import streamlit as st
-import re
-from urllib.parse import quote_plus
-from datetime import datetime
-
+import streamlit as st  # Streamlit 웹 앱 라이브러리
+import re  # 문자열 정규표현식 처리
+from urllib.parse import quote_plus  # URL 인코딩
+from datetime import datetime  # 날짜/시간 처리
 # -----------------------------
 # Page config
 # -----------------------------
@@ -129,9 +128,11 @@ with st.sidebar:
     - **심한 통증, 호흡곤란, 의식 변화** 등 위험 신호가 보이면 즉시 **119**에 연락하세요.
     """)
 
+# 메인 화면 제목/캡션
 st.title("🆘 내 증상에 맞는 응급처치와 진료과 안내")
 st.caption("입력 예: ‘가슴이 조여오고 왼팔로 통증이 퍼지면서 식은땀이 나요’ · ‘뜨거운 물에 데였고 물집이 생겼어요’ · ‘발목을 접질렀어요’")
 
+#사용자 입력 영
 col1, col2 = st.columns([2, 1])
 with col1:
     text = st.text_area("어디가 아픈가요/어떻게 다쳤나요?", height=160, placeholder="증상, 발생 상황, 동반 증상 등을 적어주세요.")
@@ -140,6 +141,7 @@ with col2:
     st.write("")
     st.markdown("**오늘 날짜**: " + datetime.now().strftime("%Y-%m-%d %H:%M"))
 
+# 분석 버튼
 run = st.button("🔎 분석하기")
 
 if run:
@@ -177,6 +179,7 @@ if run:
                     st.markdown("**위험 신호 (보이면 즉시 병원)**")
                     st.markdown(", ".join(c["red_flags"]))
 
+            # 진료과/장소 안내
             st.subheader("🏥 어디로 가야 하나요?")
             if final_triage == 1:
                 base = "응급실"
